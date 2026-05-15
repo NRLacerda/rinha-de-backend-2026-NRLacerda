@@ -1,40 +1,101 @@
 package main
 
 import (
+	"encoding/json"
+	"fmt"
 	"log"
+	"os"
+	"time"
 
-	"github.com/NRLacerda/rinha-de-backend-2026/internal/vptree"
+	"github.com/NRLacerda/rinha-de-backend-2026/internal/hnsw"
 )
+
+const (
+	M   = 8   // HNSW connections per node (M0=16 at level 0)
+	efC = 200 // efConstruction — higher = better recall, slower build
+)
+
+type jsonRecord struct {
+	Vector [hnsw.Dims]float32 `json:"vector"`
+	Label  string             `json:"label"`
+}
 
 func main() {
 	log.Println("loading references.json...")
-	records, err := vptree.LoadJSON("resources/references.json")
-	if err != nil {
-		log.Fatalf("failed to load dataset: %v", err)
-	}
-	log.Printf("loaded %d records", len(records))
+	t0 := time.Now()
 
-	var nullPool, fullPool []vptree.Record
-	for _, r := range records {
-		if r.Vector[5] == -1 {
-			nullPool = append(nullPool, r)
-		} else {
-			fullPool = append(fullPool, r)
+	f, err := os.Open("resources/references.json")
+	if err != nil {
+		log.Fatalf("open: %v", err)
+	}
+
+	// First pass: count records.
+	var n int
+	dec := json.NewDecoder(f)
+	if _, err := dec.Token(); err != nil { // consume '['
+		log.Fatalf("read '[': %v", err)
+	}
+	for dec.More() {
+		var r jsonRecord
+		if err := dec.Decode(&r); err != nil {
+			log.Fatalf("decode: %v", err)
+		}
+		n++
+	}
+	f.Close()
+
+	log.Printf("counted %d records in %s", n, time.Since(t0))
+
+	// Second pass: load into arrays.
+	f, err = os.Open("resources/references.json")
+	if err != nil {
+		log.Fatalf("open: %v", err)
+	}
+	dec = json.NewDecoder(f)
+	if _, err := dec.Token(); err != nil {
+		log.Fatalf("read '[': %v", err)
+	}
+
+	vectors := make([]float32, n*hnsw.Dims)
+	labels := make([]uint8, n)
+
+	for i := 0; dec.More(); i++ {
+		var r jsonRecord
+		if err := dec.Decode(&r); err != nil {
+			log.Fatalf("decode %d: %v", i, err)
+		}
+		copy(vectors[i*hnsw.Dims:], r.Vector[:])
+		if r.Label == "fraud" {
+			labels[i] = 1
+		}
+		if i%500_000 == 0 {
+			fmt.Printf("  loaded %d/%d\n", i, n)
 		}
 	}
-	log.Printf("null-pool=%d full-pool=%d", len(nullPool), len(fullPool))
+	f.Close()
+	log.Printf("loaded in %s", time.Since(t0))
 
-	log.Println("building null-pool tree...")
-	treeNull := vptree.Build(nullPool)
-	if err := treeNull.Save("resources/vptree-null.bin"); err != nil {
-		log.Fatalf("save null tree: %v", err)
-	}
-	log.Println("null tree saved")
+	log.Printf("building HNSW (M=%d, efConstruction=%d)...", M, efC)
+	t1 := time.Now()
 
-	log.Println("building full-pool tree...")
-	treeFull := vptree.Build(fullPool)
-	if err := treeFull.Save("resources/vptree-full.bin"); err != nil {
-		log.Fatalf("save full tree: %v", err)
+	idx := hnsw.New(n, M, efC)
+	for i := 0; i < n; i++ {
+		idx.AddVector(int32(i), vectors[i*hnsw.Dims:i*hnsw.Dims+hnsw.Dims])
 	}
-	log.Println("full tree saved")
+	for i := 0; i < n; i++ {
+		idx.Insert(int32(i))
+		if i%500_000 == 0 && i > 0 {
+			elapsed := time.Since(t1)
+			eta := time.Duration(float64(elapsed) / float64(i) * float64(n-i))
+			fmt.Printf("  inserted %d/%d  ETA %s\n", i, n, eta.Round(time.Second))
+		}
+	}
+
+	log.Printf("build done in %s", time.Since(t1))
+
+	log.Println("saving hnsw.bin...")
+	if err := idx.SaveWithLabels("resources/hnsw.bin", labels); err != nil {
+		log.Fatalf("save: %v", err)
+	}
+	log.Println("done")
 }
