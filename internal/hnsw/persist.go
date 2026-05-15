@@ -11,14 +11,16 @@ import (
 // SaveWithLabels serializes the HNSW index + labels to a binary file.
 //
 // Format (little-endian):
-//   int32  N, M, M0, EfConstruction, ep, epLevel
-//   [N*Dims] float32  vectors
-//   [N]      uint8    nodeLevel
-//   [N*M0]   int32    conn0
-//   [N]      uint8    conn0cnt
-//   upper-level entries: {int32 nodeID, uint8 numLevels, per-level: {uint8 cnt, cnt×int32 nbs}}
-//   int32 -1            sentinel (end of upper data)
-//   [N]      uint8    labels
+//   int32    N, M, M0, EfConstruction, ep, epLevel
+//   float32  qScale[Dims]          (14 × 4B = 56B)
+//   float32  qZero[Dims]           (14 × 4B = 56B)
+//   uint8    vectors[N*Dims]       (42 MB at N=3M — was 168 MB as float32)
+//   uint8    nodeLevel[N]
+//   int32    conn0[N*M0]
+//   uint8    conn0cnt[N]
+//   upper entries: {int32 nodeID, uint8 numLevels, per-level: {uint8 cnt, cnt×int32 nbs}}
+//   int32    -1 sentinel
+//   uint8    labels[N]
 func (h *HNSW) SaveWithLabels(path string, labels []uint8) error {
 	f, err := os.Create(path)
 	if err != nil {
@@ -26,7 +28,7 @@ func (h *HNSW) SaveWithLabels(path string, labels []uint8) error {
 	}
 	defer f.Close()
 
-	bw := bufio.NewWriterSize(f, 1<<20) // 1 MB write buffer
+	bw := bufio.NewWriterSize(f, 1<<20)
 
 	wi32 := func(v int32) error {
 		var b [4]byte
@@ -42,7 +44,13 @@ func (h *HNSW) SaveWithLabels(path string, labels []uint8) error {
 		}
 	}
 
-	if err := binary.Write(bw, binary.LittleEndian, h.vectors[:h.N*Dims]); err != nil {
+	if err := binary.Write(bw, binary.LittleEndian, h.qScale); err != nil {
+		return err
+	}
+	if err := binary.Write(bw, binary.LittleEndian, h.qZero); err != nil {
+		return err
+	}
+	if _, err := bw.Write(h.vectors[:h.N*Dims]); err != nil {
 		return err
 	}
 	if _, err := bw.Write(h.nodeLevel[:h.N]); err != nil {
@@ -55,12 +63,11 @@ func (h *HNSW) SaveWithLabels(path string, labels []uint8) error {
 		return err
 	}
 
-	for id := 0; id < h.N; id++ {
-		uc := h.upperConns[id]
+	for id, uc := range h.upperConns {
 		if len(uc) == 0 {
 			continue
 		}
-		if err := wi32(int32(id)); err != nil {
+		if err := wi32(id); err != nil {
 			return err
 		}
 		if err := wu8(uint8(len(uc))); err != nil {
@@ -86,6 +93,7 @@ func (h *HNSW) SaveWithLabels(path string, labels []uint8) error {
 }
 
 // Load reads a previously saved HNSW index and its labels.
+// nodeLevel is freed immediately — not needed for Query.
 func Load(path string) (*HNSW, []uint8, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -126,20 +134,28 @@ func Load(path string) (*HNSW, []uint8, error) {
 		N:              n,
 		ep:             ep,
 		epLevel:        int(epLevel32),
-		vectors:        make([]float32, n*Dims),
+		vectors:        make([]uint8, n*Dims),
 		nodeLevel:      make([]uint8, n),
 		conn0:          make([]int32, n*m0),
 		conn0cnt:       make([]uint8, n),
-		upperConns:     make([][][]int32, n),
-		visitMark:      make([]uint64, n),
+		upperConns:     make(map[int32][][]int32),
+		visitMark:      make([]uint32, n),
 	}
 
-	if err := binary.Read(br, binary.LittleEndian, h.vectors); err != nil {
+	if err := binary.Read(br, binary.LittleEndian, &h.qScale); err != nil {
+		return nil, nil, fmt.Errorf("qScale: %w", err)
+	}
+	if err := binary.Read(br, binary.LittleEndian, &h.qZero); err != nil {
+		return nil, nil, fmt.Errorf("qZero: %w", err)
+	}
+	if _, err := io.ReadFull(br, h.vectors); err != nil {
 		return nil, nil, fmt.Errorf("vectors: %w", err)
 	}
 	if _, err := io.ReadFull(br, h.nodeLevel); err != nil {
 		return nil, nil, fmt.Errorf("nodeLevel: %w", err)
 	}
+	h.nodeLevel = nil // not needed for Query
+
 	if err := binary.Read(br, binary.LittleEndian, h.conn0); err != nil {
 		return nil, nil, fmt.Errorf("conn0: %w", err)
 	}
@@ -156,15 +172,16 @@ func Load(path string) (*HNSW, []uint8, error) {
 			break
 		}
 		numLevels, _ := ru8()
-		h.upperConns[id] = make([][]int32, numLevels)
+		uc := make([][]int32, numLevels)
 		for l := 0; l < int(numLevels); l++ {
 			cnt, _ := ru8()
 			nbs := make([]int32, cnt)
 			if err := binary.Read(br, binary.LittleEndian, nbs); err != nil {
 				return nil, nil, fmt.Errorf("upper nbs: %w", err)
 			}
-			h.upperConns[id][l] = nbs
+			uc[l] = nbs
 		}
+		h.upperConns[id] = uc
 	}
 
 	labels := make([]uint8, n)
