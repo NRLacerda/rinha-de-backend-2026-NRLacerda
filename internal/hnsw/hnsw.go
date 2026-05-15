@@ -10,16 +10,20 @@ import (
 const Dims = 14
 const maxEf = 512
 
-// HNSW is a Hierarchical Navigable Small World graph index.
+// HNSW is a Hierarchical Navigable Small World graph index with uint8-quantized vectors.
 //
-// Memory layout (for N=3M, M=8, int8-quantized vectors):
-//   vectors   [N*14]uint8    =  42 MB  (quantized float32→uint8, 4× smaller)
-//   conn0     [N*M0]int32    = 192 MB  (M0=16 at M=8)
+// Distance metric: squared integer Euclidean in uint8 space (no sqrt, no scale).
+// All comparisons use squared distances — ranking is identical to true Euclidean.
+// The query float32 vector is quantized to uint8 ONCE per Query call; every
+// individual distance computation is then pure integer arithmetic.
+//
+// Memory layout (N=3M, M=8):
+//   vectors   [N*14]uint8    =  42 MB
+//   conn0     [N*M0]int32    = 192 MB  (M0=16)
 //   conn0cnt  [N]uint8       =   3 MB
 //   visitMark [N]uint32      =  12 MB
 //   upperConns map ~sparse   =  ~30 MB
-//   qScale/qZero [14]float32 =  <1 MB
-//   Go runtime               =  ~15 MB
+//   misc/runtime             =  ~15 MB
 //   Total                    = ~294 MB  (fits in 316 MB)
 type HNSW struct {
 	M, M0, EfConstruction int
@@ -29,13 +33,13 @@ type HNSW struct {
 	ep      int32
 	epLevel int
 
-	// Per-dimension quantization params: stored_val = (float32_val - qZero) / qScale
-	// Dequantize: float32_val = float32(stored_val)*qScale + qZero
+	// Quantization params: float32_value ≈ float32(stored_uint8)*qScale[d] + qZero[d]
+	// Used only to quantize incoming float32 query vectors — NOT in the distance hot path.
 	qScale [Dims]float32
 	qZero  [Dims]float32
 
 	vectors   []uint8 // [N * Dims] quantized as uint8
-	nodeLevel []uint8 // [N] max level — nil after Load
+	nodeLevel []uint8 // [N] — nil after Load
 
 	conn0    []int32 // [N * M0]
 	conn0cnt []uint8 // [N]
@@ -46,7 +50,6 @@ type HNSW struct {
 	visitMark []uint32 // [N]
 }
 
-// New creates an empty HNSW. Call SetQuantization before AddVector.
 func New(n, m, efC int) *HNSW {
 	m0 := 2 * m
 	h := &HNSW{
@@ -64,7 +67,6 @@ func New(n, m, efC int) *HNSW {
 		upperConns:     make(map[int32][][]int32),
 		visitMark:      make([]uint32, n),
 	}
-	// Default: identity quantization (scale=1, zero=0) so uint8 values map directly.
 	for d := range h.qScale {
 		h.qScale[d] = 1
 	}
@@ -74,16 +76,13 @@ func New(n, m, efC int) *HNSW {
 	return h
 }
 
-// SetQuantization configures per-dimension dequantization params.
-// Must be called before AddVector. scale[d] and zero[d] satisfy:
-//
-//	float32_value ≈ float32(stored_uint8) * scale[d] + zero[d]
+// SetQuantization configures per-dimension params used to quantize incoming float32 queries.
 func (h *HNSW) SetQuantization(scale, zero [Dims]float32) {
 	h.qScale = scale
 	h.qZero = zero
 }
 
-// AddVector quantizes vec to uint8 and stores it at slot id.
+// AddVector quantizes vec to uint8 and stores at slot id.
 func (h *HNSW) AddVector(id int32, vec []float32) {
 	base := int(id) * Dims
 	for d := 0; d < Dims; d++ {
@@ -93,70 +92,86 @@ func (h *HNSW) AddVector(id int32, vec []float32) {
 		} else if v > 255 {
 			v = 255
 		}
-		h.vectors[base+d] = uint8(v + 0.5) // round
+		h.vectors[base+d] = uint8(v + 0.5)
 	}
 }
 
-// ---- Distance ---------------------------------------------------------------
-
-// dist computes Euclidean distance from float32 query q to quantized stored node id.
-// Unrolled for 14 dims.
-func (h *HNSW) dist(q []float32, id int32) float32 {
+// ---- Distance (pure integer, no sqrt) ---------------------------------------
+//
+// dist returns SQUARED integer Euclidean distance between pre-quantized int16
+// query q and stored uint8 node id. Stored as float32 for use in pair.d.
+// Dropping sqrt is safe: all comparisons only need relative ordering.
+//
+// Unrolled for 14 dims — helps the compiler emit SIMD integer ops.
+func (h *HNSW) dist(q []int16, id int32) float32 {
 	v := h.vectors[int(id)*Dims : int(id)*Dims+Dims]
-	d0 := q[0] - (float32(v[0])*h.qScale[0] + h.qZero[0])
-	d1 := q[1] - (float32(v[1])*h.qScale[1] + h.qZero[1])
-	d2 := q[2] - (float32(v[2])*h.qScale[2] + h.qZero[2])
-	d3 := q[3] - (float32(v[3])*h.qScale[3] + h.qZero[3])
-	d4 := q[4] - (float32(v[4])*h.qScale[4] + h.qZero[4])
-	d5 := q[5] - (float32(v[5])*h.qScale[5] + h.qZero[5])
-	d6 := q[6] - (float32(v[6])*h.qScale[6] + h.qZero[6])
-	d7 := q[7] - (float32(v[7])*h.qScale[7] + h.qZero[7])
-	d8 := q[8] - (float32(v[8])*h.qScale[8] + h.qZero[8])
-	d9 := q[9] - (float32(v[9])*h.qScale[9] + h.qZero[9])
-	d10 := q[10] - (float32(v[10])*h.qScale[10] + h.qZero[10])
-	d11 := q[11] - (float32(v[11])*h.qScale[11] + h.qZero[11])
-	d12 := q[12] - (float32(v[12])*h.qScale[12] + h.qZero[12])
-	d13 := q[13] - (float32(v[13])*h.qScale[13] + h.qZero[13])
-	return float32(math.Sqrt(float64(
-		d0*d0 + d1*d1 + d2*d2 + d3*d3 + d4*d4 +
-			d5*d5 + d6*d6 + d7*d7 + d8*d8 + d9*d9 +
-			d10*d10 + d11*d11 + d12*d12 + d13*d13,
-	)))
+	d0 := int32(q[0]) - int32(v[0])
+	d1 := int32(q[1]) - int32(v[1])
+	d2 := int32(q[2]) - int32(v[2])
+	d3 := int32(q[3]) - int32(v[3])
+	d4 := int32(q[4]) - int32(v[4])
+	d5 := int32(q[5]) - int32(v[5])
+	d6 := int32(q[6]) - int32(v[6])
+	d7 := int32(q[7]) - int32(v[7])
+	d8 := int32(q[8]) - int32(v[8])
+	d9 := int32(q[9]) - int32(v[9])
+	d10 := int32(q[10]) - int32(v[10])
+	d11 := int32(q[11]) - int32(v[11])
+	d12 := int32(q[12]) - int32(v[12])
+	d13 := int32(q[13]) - int32(v[13])
+	return float32(d0*d0 + d1*d1 + d2*d2 + d3*d3 + d4*d4 +
+		d5*d5 + d6*d6 + d7*d7 + d8*d8 + d9*d9 +
+		d10*d10 + d11*d11 + d12*d12 + d13*d13)
 }
 
-// distStored computes Euclidean distance between two stored (quantized) nodes.
-// Used during build-time neighbor pruning.
-// Since zero cancels in subtraction: (a-zero)*scale - (b-zero)*scale = (a-b)*scale
-func (h *HNSW) distStored(a, b []uint8) float32 {
-	d0 := (float32(a[0]) - float32(b[0])) * h.qScale[0]
-	d1 := (float32(a[1]) - float32(b[1])) * h.qScale[1]
-	d2 := (float32(a[2]) - float32(b[2])) * h.qScale[2]
-	d3 := (float32(a[3]) - float32(b[3])) * h.qScale[3]
-	d4 := (float32(a[4]) - float32(b[4])) * h.qScale[4]
-	d5 := (float32(a[5]) - float32(b[5])) * h.qScale[5]
-	d6 := (float32(a[6]) - float32(b[6])) * h.qScale[6]
-	d7 := (float32(a[7]) - float32(b[7])) * h.qScale[7]
-	d8 := (float32(a[8]) - float32(b[8])) * h.qScale[8]
-	d9 := (float32(a[9]) - float32(b[9])) * h.qScale[9]
-	d10 := (float32(a[10]) - float32(b[10])) * h.qScale[10]
-	d11 := (float32(a[11]) - float32(b[11])) * h.qScale[11]
-	d12 := (float32(a[12]) - float32(b[12])) * h.qScale[12]
-	d13 := (float32(a[13]) - float32(b[13])) * h.qScale[13]
-	return float32(math.Sqrt(float64(
-		d0*d0 + d1*d1 + d2*d2 + d3*d3 + d4*d4 +
-			d5*d5 + d6*d6 + d7*d7 + d8*d8 + d9*d9 +
-			d10*d10 + d11*d11 + d12*d12 + d13*d13,
-	)))
+// distStored returns squared integer Euclidean distance between two stored uint8 nodes.
+// Used only during build-time pruning — same metric as dist, but both inputs are uint8.
+func distStored(a, b []uint8) float32 {
+	d0 := int32(a[0]) - int32(b[0])
+	d1 := int32(a[1]) - int32(b[1])
+	d2 := int32(a[2]) - int32(b[2])
+	d3 := int32(a[3]) - int32(b[3])
+	d4 := int32(a[4]) - int32(b[4])
+	d5 := int32(a[5]) - int32(b[5])
+	d6 := int32(a[6]) - int32(b[6])
+	d7 := int32(a[7]) - int32(b[7])
+	d8 := int32(a[8]) - int32(b[8])
+	d9 := int32(a[9]) - int32(b[9])
+	d10 := int32(a[10]) - int32(b[10])
+	d11 := int32(a[11]) - int32(b[11])
+	d12 := int32(a[12]) - int32(b[12])
+	d13 := int32(a[13]) - int32(b[13])
+	return float32(d0*d0 + d1*d1 + d2*d2 + d3*d3 + d4*d4 +
+		d5*d5 + d6*d6 + d7*d7 + d8*d8 + d9*d9 +
+		d10*d10 + d11*d11 + d12*d12 + d13*d13)
+}
+
+// quantizeQuery converts an incoming float32 query to int16 (uint8 range, signed
+// for subtraction). Called once per Query — amortized over all distance computations.
+func (h *HNSW) quantizeQuery(q [Dims]float32) [Dims]int16 {
+	var qv [Dims]int16
+	for d := 0; d < Dims; d++ {
+		v := (q[d] - h.qZero[d]) / h.qScale[d]
+		if v < 0 {
+			v = 0
+		} else if v > 255 {
+			v = 255
+		}
+		qv[d] = int16(v + 0.5)
+	}
+	return qv
 }
 
 // ---- pair type and zero-alloc heaps ----------------------------------------
 
 type pair struct {
-	d  float32
+	d  float32 // squared integer distance — comparable as-is
 	id int32
 }
 
+// queryState holds pre-allocated heaps and the pre-quantized query vector.
 type queryState struct {
+	qVec       [Dims]int16
 	cands      []pair
 	results    []pair
 	candsArr   [maxEf]pair
@@ -298,11 +313,12 @@ func (h *HNSW) setNeighbors(id int32, nbs []int32, level int) {
 
 // ---- Core search ------------------------------------------------------------
 
-func (h *HNSW) searchLayer(q []float32, ep int32, ef, level int, qs *queryState) {
+// searchLayer uses the pre-quantized qs.qVec for all distance computations.
+func (h *HNSW) searchLayer(ep int32, ef, level int, qs *queryState) {
 	gen := h.visitGen.Add(1)
 	h.visitMark[ep] = gen
 
-	d0 := h.dist(q, ep)
+	d0 := h.dist(qs.qVec[:], ep)
 	qs.cands = qs.cands[:0]
 	qs.results = qs.results[:0]
 	minPush(&qs.cands, pair{d0, ep})
@@ -318,7 +334,7 @@ func (h *HNSW) searchLayer(q []float32, ep int32, ef, level int, qs *queryState)
 				continue
 			}
 			h.visitMark[nb] = gen
-			nd := h.dist(q, nb)
+			nd := h.dist(qs.qVec[:], nb)
 			if len(qs.results) < ef || nd < qs.results[0].d {
 				minPush(&qs.cands, pair{nd, nb})
 				maxPush(&qs.results, pair{nd, nb})
@@ -346,14 +362,6 @@ func selectNeighbors(candidates []pair, m int) []pair {
 // ---- Insert -----------------------------------------------------------------
 
 func (h *HNSW) Insert(id int32) {
-	// Dequantize the stored vector to use as float32 search query.
-	var qArr [Dims]float32
-	base := int(id) * Dims
-	for d := 0; d < Dims; d++ {
-		qArr[d] = float32(h.vectors[base+d])*h.qScale[d] + h.qZero[d]
-	}
-	q := qArr[:]
-
 	lvl := int(math.Floor(-math.Log(rand.Float64()) * h.mL))
 	if lvl > 16 {
 		lvl = 16
@@ -370,12 +378,17 @@ func (h *HNSW) Insert(id int32) {
 	ep := h.ep
 	curLevel := h.epLevel
 
+	// Use stored uint8 values directly as int16 — no dequantization needed.
 	qs := &queryState{}
 	qs.cands = qs.candsArr[:0]
 	qs.results = qs.resultsArr[:0]
+	base := int(id) * Dims
+	for d := 0; d < Dims; d++ {
+		qs.qVec[d] = int16(h.vectors[base+d])
+	}
 
 	for l := curLevel; l > lvl; l-- {
-		h.searchLayer(q, ep, 1, l, qs)
+		h.searchLayer(ep, 1, l, qs)
 		ep = closestInResults(qs.results)
 	}
 
@@ -385,7 +398,7 @@ func (h *HNSW) Insert(id int32) {
 			mMax = h.M0
 		}
 
-		h.searchLayer(q, ep, h.EfConstruction, l, qs)
+		h.searchLayer(ep, h.EfConstruction, l, qs)
 
 		W := make([]pair, len(qs.results))
 		copy(W, qs.results)
@@ -409,7 +422,7 @@ func (h *HNSW) Insert(id int32) {
 				nbVec := h.vectors[int(nb.id)*Dims : int(nb.id)*Dims+Dims]
 				pairs := make([]pair, len(combined))
 				for i, n := range combined {
-					pairs[i] = pair{h.distStored(nbVec, h.vectors[int(n)*Dims:int(n)*Dims+Dims]), n}
+					pairs[i] = pair{distStored(nbVec, h.vectors[int(n)*Dims:int(n)*Dims+Dims]), n}
 				}
 				pruned := selectNeighbors(pairs, mMax)
 				pruneIDs := make([]int32, len(pruned))
@@ -453,16 +466,16 @@ func (h *HNSW) Query(q [Dims]float32, labels []uint8, ef int) float32 {
 	qs := statePool.Get().(*queryState)
 	qs.cands = qs.candsArr[:0]
 	qs.results = qs.resultsArr[:0]
+	// Quantize the incoming float32 query ONCE — all distance calls reuse qs.qVec.
+	qs.qVec = h.quantizeQuery(q)
 	defer statePool.Put(qs)
 
-	qSlice := q[:]
 	ep := h.ep
-
 	for l := h.epLevel; l > 0; l-- {
-		h.searchLayer(qSlice, ep, 1, l, qs)
+		h.searchLayer(ep, 1, l, qs)
 		ep = qs.results[0].id
 	}
-	h.searchLayer(qSlice, ep, ef, 0, qs)
+	h.searchLayer(ep, ef, 0, qs)
 
 	const k = 5
 	results := qs.results
@@ -479,8 +492,7 @@ func (h *HNSW) Query(q [Dims]float32, labels []uint8, ef int) float32 {
 func (h *HNSW) Ep() int32    { return h.ep }
 func (h *HNSW) EpLevel() int { return h.epLevel }
 
-// Vectors returns a dequantized float32 copy of all stored vectors.
-// Allocates N*Dims float32s — intended for testing only.
+// Vectors returns dequantized float32 copies of all stored vectors. Tests only.
 func (h *HNSW) Vectors() []float32 {
 	out := make([]float32, h.N*Dims)
 	for i := 0; i < h.N; i++ {
