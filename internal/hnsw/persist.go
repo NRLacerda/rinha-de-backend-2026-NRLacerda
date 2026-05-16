@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"runtime"
 )
 
 // SaveWithLabels serializes the HNSW index + labels to a binary file.
@@ -154,7 +155,10 @@ func Load(path string) (*HNSW, []uint8, error) {
 	if _, err := io.ReadFull(br, h.nodeLevel); err != nil {
 		return nil, nil, fmt.Errorf("nodeLevel: %w", err)
 	}
-	h.nodeLevel = nil // not needed for Query
+	h.nodeLevel = nil  // not needed for Query
+	h.visitMark = nil  // replaced by visitPool; free 12 MB before allocating pool slots
+	runtime.GC()
+	h.initVisitPool(2, h.N) // 2 concurrent queries × 12 MB = 24 MB, total ~306 MB
 
 	if err := binary.Read(br, binary.LittleEndian, h.conn0); err != nil {
 		return nil, nil, fmt.Errorf("conn0: %w", err)

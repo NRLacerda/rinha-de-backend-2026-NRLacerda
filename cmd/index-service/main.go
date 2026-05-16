@@ -20,7 +20,7 @@ var (
 )
 
 func main() {
-	runtime.GOMAXPROCS(1)
+	runtime.GOMAXPROCS(2)
 
 	var err error
 	index, labels, err = hnsw.Load("resources/hnsw.bin")

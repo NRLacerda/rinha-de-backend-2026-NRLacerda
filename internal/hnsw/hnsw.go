@@ -7,6 +7,14 @@ import (
 	"sync/atomic"
 )
 
+// visitSlot holds a per-query visited marker array and its generation counter.
+// Concurrent queries each own one slot from HNSW.visitPool, eliminating data races
+// on the shared visitMark that existed with the previous single-array design.
+type visitSlot struct {
+	mark []uint32
+	gen  uint32
+}
+
 const Dims = 14
 const maxEf = 512
 
@@ -47,7 +55,8 @@ type HNSW struct {
 	upperConns map[int32][][]int32
 
 	visitGen  atomic.Uint32
-	visitMark []uint32 // [N]
+	visitMark []uint32       // [N] — used only during Insert (build time); nil after Load
+	visitPool chan *visitSlot // bounded pool for concurrent Query calls
 }
 
 func New(n, m, efC int) *HNSW {
@@ -67,6 +76,7 @@ func New(n, m, efC int) *HNSW {
 		upperConns:     make(map[int32][][]int32),
 		visitMark:      make([]uint32, n),
 	}
+	h.initVisitPool(2, n)
 	for d := range h.qScale {
 		h.qScale[d] = 1
 	}
@@ -74,6 +84,15 @@ func New(n, m, efC int) *HNSW {
 		h.conn0[i] = -1
 	}
 	return h
+}
+
+// initVisitPool allocates n visitSlots for concurrent Query use.
+// Must be called after h.N is set. Replaces h.visitMark for query-time use.
+func (h *HNSW) initVisitPool(poolSize, markSize int) {
+	h.visitPool = make(chan *visitSlot, poolSize)
+	for i := 0; i < poolSize; i++ {
+		h.visitPool <- &visitSlot{mark: make([]uint32, markSize)}
+	}
 }
 
 // SetQuantization configures per-dimension params used to quantize incoming float32 queries.
@@ -314,10 +333,17 @@ func (h *HNSW) setNeighbors(id int32, nbs []int32, level int) {
 // ---- Core search ------------------------------------------------------------
 
 // searchLayer uses the pre-quantized qs.qVec for all distance computations.
-func (h *HNSW) searchLayer(ep int32, ef, level int, qs *queryState) {
-	gen := h.visitGen.Add(1)
-	h.visitMark[ep] = gen
+// vs is the caller-owned visitSlot — its gen is incremented once per call.
+func (h *HNSW) searchLayer(ep int32, ef, level int, qs *queryState, vs *visitSlot) {
+	vs.gen++
+	if vs.gen == 0 {
+		clear(vs.mark)
+		vs.gen = 1
+	}
+	gen := vs.gen
+	mark := vs.mark
 
+	mark[ep] = gen
 	d0 := h.dist(qs.qVec[:], ep)
 	qs.cands = qs.cands[:0]
 	qs.results = qs.results[:0]
@@ -330,10 +356,10 @@ func (h *HNSW) searchLayer(ep int32, ef, level int, qs *queryState) {
 			break
 		}
 		for _, nb := range h.neighborsAt(c.id, level) {
-			if nb < 0 || h.visitMark[nb] == gen {
+			if nb < 0 || mark[nb] == gen {
 				continue
 			}
-			h.visitMark[nb] = gen
+			mark[nb] = gen
 			nd := h.dist(qs.qVec[:], nb)
 			if len(qs.results) < ef || nd < qs.results[0].d {
 				minPush(&qs.cands, pair{nd, nb})
@@ -387,8 +413,12 @@ func (h *HNSW) Insert(id int32) {
 		qs.qVec[d] = int16(h.vectors[base+d])
 	}
 
+	// Build-time visitSlot backed by the struct's visitMark (single-threaded Insert).
+	vs := &visitSlot{mark: h.visitMark, gen: uint32(h.visitGen.Load())}
+	defer func() { h.visitGen.Store(vs.gen) }()
+
 	for l := curLevel; l > lvl; l-- {
-		h.searchLayer(ep, 1, l, qs)
+		h.searchLayer(ep, 1, l, qs, vs)
 		ep = closestInResults(qs.results)
 	}
 
@@ -398,7 +428,7 @@ func (h *HNSW) Insert(id int32) {
 			mMax = h.M0
 		}
 
-		h.searchLayer(ep, h.EfConstruction, l, qs)
+		h.searchLayer(ep, h.EfConstruction, l, qs, vs)
 
 		W := make([]pair, len(qs.results))
 		copy(W, qs.results)
@@ -463,6 +493,9 @@ func (h *HNSW) Query(q [Dims]float32, labels []uint8, ef int) float32 {
 		return 0
 	}
 
+	vs := <-h.visitPool
+	defer func() { h.visitPool <- vs }()
+
 	qs := statePool.Get().(*queryState)
 	qs.cands = qs.candsArr[:0]
 	qs.results = qs.resultsArr[:0]
@@ -472,10 +505,10 @@ func (h *HNSW) Query(q [Dims]float32, labels []uint8, ef int) float32 {
 
 	ep := h.ep
 	for l := h.epLevel; l > 0; l-- {
-		h.searchLayer(ep, 1, l, qs)
+		h.searchLayer(ep, 1, l, qs, vs)
 		ep = qs.results[0].id
 	}
-	h.searchLayer(ep, ef, 0, qs)
+	h.searchLayer(ep, ef, 0, qs, vs)
 
 	const k = 5
 	results := qs.results
