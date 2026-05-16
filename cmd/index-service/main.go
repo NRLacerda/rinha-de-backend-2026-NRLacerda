@@ -22,16 +22,13 @@ var (
 func main() {
 	runtime.GOMAXPROCS(1)
 
-	log.Println("loading hnsw.bin...")
 	var err error
 	index, labels, err = hnsw.Load("resources/hnsw.bin")
 	if err != nil {
 		log.Fatalf("load: %v", err)
 	}
-	log.Printf("loaded %d vectors, ep=%d epLevel=%d", index.N, index.Ep(), index.EpLevel())
 	ready.Store(true)
 
-	log.Println("index service listening on :9000")
 	if err := fasthttp.ListenAndServe(":9000", handle); err != nil {
 		log.Fatalf("serve: %v", err)
 	}

@@ -10,12 +10,7 @@ import (
 
 func main() {
 	runtime.GOMAXPROCS(1)
-
-	indexURL := "http://index:9000/query"
-
-	h := handler.New(indexURL)
-
-	log.Println("api listening on :8080")
+	h := handler.New("http://index:9000/query")
 	if err := fasthttp.ListenAndServe(":8080", h.Handle); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
