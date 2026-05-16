@@ -7,9 +7,9 @@ services:
       - "9999:9999"
     depends_on:
       api1:
-        condition: service_healthy
+        condition: service_started
       api2:
-        condition: service_healthy
+        condition: service_started
     deploy:
       resources:
         limits:
@@ -22,7 +22,7 @@ services:
       - "8080"
     depends_on:
       index:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/ready"]
       interval: 5s
@@ -41,7 +41,7 @@ services:
       - "8080"
     depends_on:
       index:
-        condition: service_healthy
+        condition: service_started
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:8080/ready"]
       interval: 5s
