@@ -14,7 +14,7 @@ services:
       resources:
         limits:
           cpus: "0.05"
-          memory: "5MB"
+          memory: "6MB"
 
   api1:
     image: ghcr.io/nrlacerda/rinha-de-backend-2026-api:latest
