@@ -1,7 +1,7 @@
 {
     "participants": ["Nicolas Rocha Lacerda"],
-    "social": ["https://github.com/NRLacerda"],
+    "social": ["https://github.com/NRLacerda", "https://www.linkedin.com/in/nicolas-rocha-lacerda-b550491b8"],
     "source-code-repo": "https://github.com/NRLacerda/rinha-de-backend-2026-NRLacerda",
     "stack": ["go", "hnsw", "fasthttp", "nginx"],
-    "open_to_work": false
+    "open_to_work": true
 }
