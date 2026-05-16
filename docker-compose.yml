@@ -1,0 +1,75 @@
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - "9999:9999"
+    depends_on:
+      api1:
+        condition: service_healthy
+      api2:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          cpus: "0.05"
+          memory: "5MB"
+
+  api1:
+    image: ghcr.io/nrlacerda/rinha-de-backend-2026-api:latest
+    expose:
+      - "8080"
+    depends_on:
+      index:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.2"
+          memory: "12MB"
+
+  api2:
+    image: ghcr.io/nrlacerda/rinha-de-backend-2026-api:latest
+    expose:
+      - "8080"
+    depends_on:
+      index:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.2"
+          memory: "12MB"
+
+  index:
+    image: ghcr.io/nrlacerda/rinha-de-backend-2026-index:latest
+    expose:
+      - "9000"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:9000/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 60
+      start_period: 120s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.55"
+          memory: "316MB"
+
+networks:
+  default:
+    driver: bridge
