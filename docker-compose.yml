@@ -56,6 +56,8 @@ services:
 
   index:
     image: ghcr.io/nrlacerda/rinha-de-backend-2026-index:latest
+    environment:
+      - GOGC=400
     expose:
       - "9000"
     healthcheck:
