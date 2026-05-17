@@ -224,7 +224,7 @@ func TestRecallFull(t *testing.T) {
 		queryIDs[i] = rng.Intn(idx.N)
 	}
 
-	for _, ef := range []int{50, 100, 200} {
+	for _, ef := range []int{10, 20, 50, 100, 200} {
 		matches := 0
 		for _, qid := range queryIDs {
 			// Build float32 query from the sampled reference vector.
@@ -263,7 +263,7 @@ func BenchmarkQueryFull(b *testing.B) {
 	rng := rand.New(rand.NewSource(7))
 	q := randomVec(rng)
 
-	for _, ef := range []int{50, 100, 200} {
+	for _, ef := range []int{10, 20, 50, 100, 200} {
 		ef := ef
 		b.Run(fmt.Sprintf("ef=%d", ef), func(b *testing.B) {
 			b.ResetTimer()
