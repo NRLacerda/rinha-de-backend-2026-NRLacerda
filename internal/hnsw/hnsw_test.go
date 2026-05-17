@@ -197,10 +197,40 @@ func BenchmarkQuery(b *testing.B) {
 	}
 }
 
+func BenchmarkQueryFast5(b *testing.B) {
+	rng := rand.New(rand.NewSource(1))
+	const n = 50_000
+
+	vecs := make([]float32, n*Dims)
+	labels := make([]uint8, n)
+	for i := 0; i < n; i++ {
+		v := randomVec(rng)
+		copy(vecs[i*Dims:], v[:])
+		labels[i] = uint8(rng.Intn(2))
+	}
+
+	idx := New(n, 8, 200)
+	idx.SetQuantization(uniformQuant(vecs, n))
+	for i := 0; i < n; i++ {
+		idx.AddVector(int32(i), vecs[i*Dims:i*Dims+Dims])
+		idx.Insert(int32(i))
+	}
+
+	q := randomVec(rng)
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		idx.QueryFast5(q, labels)
+	}
+}
+
 // TestRecallFull measures exact-score match rate against brute force on the 3M index.
 // Uses vectors sampled from the reference set itself as queries — same distribution
 // as real contest requests, unlike synthetic random vectors.
 func TestRecallFull(t *testing.T) {
+	if os.Getenv("HNSW_FULL_RECALL") != "1" {
+		t.Skip("set HNSW_FULL_RECALL=1 to run full-index recall test")
+	}
+
 	const binPath = "../../resources/hnsw.bin"
 	if _, err := os.Stat(binPath); err != nil {
 		t.Skip("hnsw.bin not found — run cmd/build-index first")
@@ -272,4 +302,11 @@ func BenchmarkQueryFull(b *testing.B) {
 			}
 		})
 	}
+
+	b.Run("fast5", func(b *testing.B) {
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			idx.QueryFast5(q, labels)
+		}
+	})
 }

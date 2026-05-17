@@ -17,6 +17,7 @@ type visitSlot struct {
 
 const Dims = 14
 const maxEf = 512
+const FastEfSearch = 5
 
 // HNSW is a Hierarchical Navigable Small World graph index with uint8-quantized vectors.
 //
@@ -55,7 +56,7 @@ type HNSW struct {
 	upperConns map[int32][][]int32
 
 	visitGen  atomic.Uint32
-	visitMark []uint32       // [N] — used only during Insert (build time); nil after Load
+	visitMark []uint32        // [N] — used only during Insert (build time); nil after Load
 	visitPool chan *visitSlot // bounded pool for concurrent Query calls
 }
 
@@ -122,7 +123,7 @@ func (h *HNSW) AddVector(id int32, vec []float32) {
 // Dropping sqrt is safe: all comparisons only need relative ordering.
 //
 // Unrolled for 14 dims — helps the compiler emit SIMD integer ops.
-func (h *HNSW) dist(q []int16, id int32) float32 {
+func (h *HNSW) dist(q []int16, id int32) uint32 {
 	v := h.vectors[int(id)*Dims : int(id)*Dims+Dims]
 	d0 := int32(q[0]) - int32(v[0])
 	d1 := int32(q[1]) - int32(v[1])
@@ -138,14 +139,14 @@ func (h *HNSW) dist(q []int16, id int32) float32 {
 	d11 := int32(q[11]) - int32(v[11])
 	d12 := int32(q[12]) - int32(v[12])
 	d13 := int32(q[13]) - int32(v[13])
-	return float32(d0*d0 + d1*d1 + d2*d2 + d3*d3 + d4*d4 +
+	return uint32(d0*d0 + d1*d1 + d2*d2 + d3*d3 + d4*d4 +
 		d5*d5 + d6*d6 + d7*d7 + d8*d8 + d9*d9 +
 		d10*d10 + d11*d11 + d12*d12 + d13*d13)
 }
 
 // distStored returns squared integer Euclidean distance between two stored uint8 nodes.
 // Used only during build-time pruning — same metric as dist, but both inputs are uint8.
-func distStored(a, b []uint8) float32 {
+func distStored(a, b []uint8) uint32 {
 	d0 := int32(a[0]) - int32(b[0])
 	d1 := int32(a[1]) - int32(b[1])
 	d2 := int32(a[2]) - int32(b[2])
@@ -160,7 +161,7 @@ func distStored(a, b []uint8) float32 {
 	d11 := int32(a[11]) - int32(b[11])
 	d12 := int32(a[12]) - int32(b[12])
 	d13 := int32(a[13]) - int32(b[13])
-	return float32(d0*d0 + d1*d1 + d2*d2 + d3*d3 + d4*d4 +
+	return uint32(d0*d0 + d1*d1 + d2*d2 + d3*d3 + d4*d4 +
 		d5*d5 + d6*d6 + d7*d7 + d8*d8 + d9*d9 +
 		d10*d10 + d11*d11 + d12*d12 + d13*d13)
 }
@@ -184,7 +185,7 @@ func (h *HNSW) quantizeQuery(q [Dims]float32) [Dims]int16 {
 // ---- pair type and zero-alloc heaps ----------------------------------------
 
 type pair struct {
-	d  float32 // squared integer distance — comparable as-is
+	d  uint32 // squared integer distance — comparable as-is
 	id int32
 }
 
@@ -335,6 +336,11 @@ func (h *HNSW) setNeighbors(id int32, nbs []int32, level int) {
 // searchLayer uses the pre-quantized qs.qVec for all distance computations.
 // vs is the caller-owned visitSlot — its gen is incremented once per call.
 func (h *HNSW) searchLayer(ep int32, ef, level int, qs *queryState, vs *visitSlot) {
+	if level == 0 {
+		h.searchLayer0(ep, ef, qs, vs)
+		return
+	}
+
 	vs.gen++
 	if vs.gen == 0 {
 		clear(vs.mark)
@@ -355,8 +361,54 @@ func (h *HNSW) searchLayer(ep int32, ef, level int, qs *queryState, vs *visitSlo
 		if c.d > qs.results[0].d && len(qs.results) >= ef {
 			break
 		}
-		for _, nb := range h.neighborsAt(c.id, level) {
+		uc := h.upperConns[c.id]
+		if uc == nil || level-1 >= len(uc) {
+			continue
+		}
+		for _, nb := range uc[level-1] {
 			if nb < 0 || mark[nb] == gen {
+				continue
+			}
+			mark[nb] = gen
+			nd := h.dist(qs.qVec[:], nb)
+			if len(qs.results) < ef || nd < qs.results[0].d {
+				minPush(&qs.cands, pair{nd, nb})
+				maxPush(&qs.results, pair{nd, nb})
+				if len(qs.results) > ef {
+					maxPop(&qs.results)
+				}
+			}
+		}
+	}
+}
+
+func (h *HNSW) searchLayer0(ep int32, ef int, qs *queryState, vs *visitSlot) {
+	vs.gen++
+	if vs.gen == 0 {
+		clear(vs.mark)
+		vs.gen = 1
+	}
+	gen := vs.gen
+	mark := vs.mark
+
+	mark[ep] = gen
+	d0 := h.dist(qs.qVec[:], ep)
+	qs.cands = qs.cands[:0]
+	qs.results = qs.results[:0]
+	minPush(&qs.cands, pair{d0, ep})
+	maxPush(&qs.results, pair{d0, ep})
+
+	conn0 := h.conn0
+	conn0cnt := h.conn0cnt
+	m0 := h.M0
+	for len(qs.cands) > 0 {
+		c := minPop(&qs.cands)
+		if c.d > qs.results[0].d && len(qs.results) >= ef {
+			break
+		}
+		base := int(c.id) * m0
+		for _, nb := range conn0[base : base+int(conn0cnt[c.id])] {
+			if mark[nb] == gen {
 				continue
 			}
 			mark[nb] = gen
@@ -518,6 +570,144 @@ func (h *HNSW) Query(q [Dims]float32, labels []uint8, ef int) float32 {
 		frauds += float32(labels[minPop(&results).id])
 	}
 	return frauds / float32(k)
+}
+
+func (h *HNSW) QueryFast5(q [Dims]float32, labels []uint8) float32 {
+	if h.ep < 0 {
+		return 0
+	}
+
+	vs := <-h.visitPool
+	defer func() { h.visitPool <- vs }()
+
+	qs := statePool.Get().(*queryState)
+	qs.cands = qs.candsArr[:0]
+	qs.qVec = h.quantizeQuery(q)
+	defer statePool.Put(qs)
+
+	ep := h.ep
+	for l := h.epLevel; l > 0; l-- {
+		ep = h.searchUpperLayer(ep, l, qs, vs)
+	}
+	h.searchLayer0Fast5(ep, qs, vs)
+
+	var frauds uint8
+	for _, p := range qs.results {
+		frauds += labels[p.id]
+	}
+	return float32(frauds) * 0.2
+}
+
+// searchUpperLayer does ef=1 beam search in an upper HNSW level.
+// Replaces searchLayer(ep, 1, level, qs, vs) with no results-heap overhead:
+// bestD/bestID track the single best result directly.
+func (h *HNSW) searchUpperLayer(ep int32, level int, qs *queryState, vs *visitSlot) int32 {
+	vs.gen++
+	if vs.gen == 0 {
+		clear(vs.mark)
+		vs.gen = 1
+	}
+	gen := vs.gen
+	mark := vs.mark
+
+	bestD := h.dist(qs.qVec[:], ep)
+	bestID := ep
+	mark[ep] = gen
+
+	qs.cands = qs.cands[:0]
+	minPush(&qs.cands, pair{bestD, ep})
+
+	for len(qs.cands) > 0 {
+		c := minPop(&qs.cands)
+		if c.d > bestD {
+			break
+		}
+		uc := h.upperConns[c.id]
+		if uc == nil || level-1 >= len(uc) {
+			continue
+		}
+		for _, nb := range uc[level-1] {
+			if nb < 0 || mark[nb] == gen {
+				continue
+			}
+			mark[nb] = gen
+			nd := h.dist(qs.qVec[:], nb)
+			if nd < bestD {
+				bestD = nd
+				bestID = nb
+				minPush(&qs.cands, pair{nd, nb})
+			}
+		}
+	}
+	return bestID
+}
+
+// searchLayer0Fast5 is a specialised layer-0 search for ef=FastEfSearch=5.
+// Results are kept in qs.resultsArr directly (no copy) as a fixed 5-slot array
+// with a tracked worst-index, eliminating all heap push/pop/siftDown overhead.
+// The candidates min-heap is unchanged.
+func (h *HNSW) searchLayer0Fast5(ep int32, qs *queryState, vs *visitSlot) {
+	vs.gen++
+	if vs.gen == 0 {
+		clear(vs.mark)
+		vs.gen = 1
+	}
+	gen := vs.gen
+	mark := vs.mark
+
+	d0 := h.dist(qs.qVec[:], ep)
+	mark[ep] = gen
+
+	qs.cands = qs.cands[:0]
+	minPush(&qs.cands, pair{d0, ep})
+
+	res := &qs.resultsArr
+	res[0] = pair{d0, ep}
+	resN := 1
+	resWorst := d0
+	resWorstIdx := 0
+
+	conn0 := h.conn0
+	conn0cnt := h.conn0cnt
+	m0 := h.M0
+
+	for len(qs.cands) > 0 {
+		c := minPop(&qs.cands)
+		if resN >= FastEfSearch && c.d > resWorst {
+			break
+		}
+		base := int(c.id) * m0
+		for _, nb := range conn0[base : base+int(conn0cnt[c.id])] {
+			if mark[nb] == gen {
+				continue
+			}
+			mark[nb] = gen
+			nd := h.dist(qs.qVec[:], nb)
+			if resN < FastEfSearch || nd < resWorst {
+				minPush(&qs.cands, pair{nd, nb})
+				if resN < FastEfSearch {
+					res[resN] = pair{nd, nb}
+					if nd > resWorst {
+						resWorst = nd
+						resWorstIdx = resN
+					}
+					resN++
+				} else {
+					res[resWorstIdx] = pair{nd, nb}
+					resWorst = res[0].d
+					resWorstIdx = 0
+					for i := 1; i < FastEfSearch; i++ {
+						if res[i].d > resWorst {
+							resWorst = res[i].d
+							resWorstIdx = i
+						}
+					}
+				}
+			}
+		}
+	}
+
+	qs.results = qs.resultsArr[:resN]
 }
 
 // ---- Accessors --------------------------------------------------------------

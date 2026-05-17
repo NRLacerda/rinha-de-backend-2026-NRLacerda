@@ -11,8 +11,6 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-const efSearch = 6
-
 var (
 	index  *hnsw.HNSW
 	labels []uint8
@@ -60,7 +58,7 @@ func handle(ctx *fasthttp.RequestCtx) {
 			q[i] = math.Float32frombits(bits)
 		}
 
-		score := index.Query(q, labels, efSearch)
+		score := index.QueryFast5(q, labels)
 
 		var resp [4]byte
 		binary.LittleEndian.PutUint32(resp[:], math.Float32bits(score))

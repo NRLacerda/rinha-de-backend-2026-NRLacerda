@@ -105,6 +105,8 @@ func main() {
 		idx.Insert(int32(i))
 	}
 
+	labels = idx.Reorder(labels)
+
 	if err := idx.SaveWithLabels("resources/hnsw.bin", labels); err != nil {
 		log.Fatalf("save: %v", err)
 	}

@@ -1,15 +1,13 @@
 package handler
 
 import (
-	"encoding/json"
 	"sync"
 
 	"github.com/NRLacerda/rinha-de-backend-2026/internal/hnsw"
 	"github.com/NRLacerda/rinha-de-backend-2026/internal/vectorize"
+	"github.com/bytedance/sonic"
 	"github.com/valyala/fasthttp"
 )
-
-const efSearch = 6
 
 var reqPool = sync.Pool{New: func() any { return new(vectorize.Request) }}
 
@@ -46,13 +44,13 @@ func (h *Handler) fraudScore(ctx *fasthttp.RequestCtx) {
 		reqPool.Put(req)
 	}()
 
-	if err := json.Unmarshal(ctx.PostBody(), req); err != nil {
+	if err := sonic.Unmarshal(ctx.PostBody(), req); err != nil {
 		respond(ctx, 0.0)
 		return
 	}
 
 	vec := vectorize.Vectorize(req)
-	score := h.index.Query(vec, h.labels, efSearch)
+	score := h.index.QueryFast5(vec, h.labels)
 	respond(ctx, score)
 }
 
