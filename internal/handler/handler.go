@@ -4,12 +4,17 @@ import (
 	"encoding/binary"
 	"math"
 	"sync"
+	"time"
 
 	"encoding/json"
 
 	"github.com/NRLacerda/rinha-de-backend-2026/internal/vectorize"
 	"github.com/valyala/fasthttp"
 )
+
+// queryTimeout is the hard deadline for each index call.
+// Well under k6's 2001ms cutoff — guarantees we always respond, never hang.
+const queryTimeout = 200 * time.Millisecond
 
 var reqPool = sync.Pool{New: func() any { return new(vectorize.Request) }}
 
@@ -77,12 +82,12 @@ func (h *Handler) fraudScore(ctx *fasthttp.RequestCtx) {
 	fReq.Header.SetMethod("POST")
 	fReq.Header.SetContentType("application/octet-stream")
 	fReq.SetBody(body[:])
-	doErr := h.client.Do(fReq, fResp)
+	doErr := h.client.DoTimeout(fReq, fResp, queryTimeout)
 	code := fResp.StatusCode()
 	respBody := fResp.Body()
 	if doErr != nil || code != fasthttp.StatusOK || len(respBody) < 4 {
-		// Never return 500 — FN (weight 3) is cheaper than HTTP error (weight 5).
-		respond(ctx, true, 0.0)
+		// On timeout/error assume fraud: FP (weight 1) < FN (weight 3) < HTTP error (weight 5).
+		respond(ctx, false, 1.0)
 		return
 	}
 
