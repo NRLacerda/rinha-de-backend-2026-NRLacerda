@@ -13,64 +13,44 @@ services:
     deploy:
       resources:
         limits:
-          cpus: "0.05"
+          cpus: "0.10"
           memory: "6MB"
 
   api1:
     image: ghcr.io/nrlacerda/rinha-de-backend-2026-api:latest
-    expose:
-      - "8080"
-    depends_on:
-      index:
-        condition: service_started
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/ready"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 10s
-    deploy:
-      resources:
-        limits:
-          cpus: "0.2"
-          memory: "12MB"
-
-  api2:
-    image: ghcr.io/nrlacerda/rinha-de-backend-2026-api:latest
-    expose:
-      - "8080"
-    depends_on:
-      index:
-        condition: service_started
-    healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:8080/ready"]
-      interval: 5s
-      timeout: 3s
-      retries: 10
-      start_period: 10s
-    deploy:
-      resources:
-        limits:
-          cpus: "0.2"
-          memory: "12MB"
-
-  index:
-    image: ghcr.io/nrlacerda/rinha-de-backend-2026-index:latest
     environment:
       - GOGC=400
     expose:
-      - "9000"
+      - "8080"
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:9000/ready"]
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/ready"]
       interval: 5s
       timeout: 3s
-      retries: 60
-      start_period: 120s
+      retries: 10
+      start_period: 10s
     deploy:
       resources:
         limits:
-          cpus: "0.55"
-          memory: "316MB"
+          cpus: "0.45"
+          memory: "172MB"
+
+  api2:
+    image: ghcr.io/nrlacerda/rinha-de-backend-2026-api:latest
+    environment:
+      - GOGC=400
+    expose:
+      - "8080"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8080/ready"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "172MB"
 
 networks:
   default:

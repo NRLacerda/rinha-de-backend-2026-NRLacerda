@@ -10,8 +10,9 @@ import (
 )
 
 const (
-	M   = 8   // HNSW connections per node (M0=16)
-	efC = 200 // efConstruction
+	M          = 6         // HNSW connections per node (M0=12)
+	efC        = 200       // efConstruction
+	maxRecords = 2_000_000 // cap at 2M to fit two copies in 350 MB total
 )
 
 type jsonRecord struct {
@@ -30,7 +31,7 @@ func main() {
 	if _, err := dec.Token(); err != nil {
 		log.Fatalf("read '[': %v", err)
 	}
-	for dec.More() {
+	for dec.More() && n < maxRecords {
 		var r jsonRecord
 		if err := dec.Decode(&r); err != nil {
 			log.Fatalf("decode: %v", err)
@@ -52,7 +53,7 @@ func main() {
 	vectors := make([]float32, n*hnsw.Dims)
 	labels := make([]uint8, n)
 
-	for i := 0; dec.More(); i++ {
+	for i := 0; i < n && dec.More(); i++ {
 		var r jsonRecord
 		if err := dec.Decode(&r); err != nil {
 			log.Fatalf("decode %d: %v", i, err)

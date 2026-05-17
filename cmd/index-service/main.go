@@ -11,7 +11,7 @@ import (
 	"github.com/valyala/fasthttp"
 )
 
-const efSearch = 10
+const efSearch = 6
 
 var (
 	index  *hnsw.HNSW
