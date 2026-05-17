@@ -19,6 +19,10 @@ const Dims = 14
 const maxEf = 512
 const FastEfSearch = 5
 
+// stride is the internal storage width per node (padded to 16 for SSE2).
+// The last 2 slots are always zero and contribute nothing to distances.
+const stride = 16
+
 // HNSW is a Hierarchical Navigable Small World graph index with uint8-quantized vectors.
 //
 // Distance metric: squared integer Euclidean in uint8 space (no sqrt, no scale).
@@ -70,7 +74,7 @@ func New(n, m, efC int) *HNSW {
 		N:              0,
 		ep:             -1,
 		epLevel:        -1,
-		vectors:        make([]uint8, n*Dims),
+		vectors:        make([]uint8, n*stride),
 		nodeLevel:      make([]uint8, n),
 		conn0:          make([]int32, n*m0),
 		conn0cnt:       make([]uint8, n),
@@ -104,7 +108,7 @@ func (h *HNSW) SetQuantization(scale, zero [Dims]float32) {
 
 // AddVector quantizes vec to uint8 and stores at slot id.
 func (h *HNSW) AddVector(id int32, vec []float32) {
-	base := int(id) * Dims
+	base := int(id) * stride
 	for d := 0; d < Dims; d++ {
 		v := (vec[d] - h.qZero[d]) / h.qScale[d]
 		if v < 0 {
@@ -114,34 +118,6 @@ func (h *HNSW) AddVector(id int32, vec []float32) {
 		}
 		h.vectors[base+d] = uint8(v + 0.5)
 	}
-}
-
-// ---- Distance (pure integer, no sqrt) ---------------------------------------
-//
-// dist returns SQUARED integer Euclidean distance between pre-quantized int16
-// query q and stored uint8 node id. Stored as float32 for use in pair.d.
-// Dropping sqrt is safe: all comparisons only need relative ordering.
-//
-// Unrolled for 14 dims — helps the compiler emit SIMD integer ops.
-func (h *HNSW) dist(q []int16, id int32) uint32 {
-	v := h.vectors[int(id)*Dims : int(id)*Dims+Dims]
-	d0 := int32(q[0]) - int32(v[0])
-	d1 := int32(q[1]) - int32(v[1])
-	d2 := int32(q[2]) - int32(v[2])
-	d3 := int32(q[3]) - int32(v[3])
-	d4 := int32(q[4]) - int32(v[4])
-	d5 := int32(q[5]) - int32(v[5])
-	d6 := int32(q[6]) - int32(v[6])
-	d7 := int32(q[7]) - int32(v[7])
-	d8 := int32(q[8]) - int32(v[8])
-	d9 := int32(q[9]) - int32(v[9])
-	d10 := int32(q[10]) - int32(v[10])
-	d11 := int32(q[11]) - int32(v[11])
-	d12 := int32(q[12]) - int32(v[12])
-	d13 := int32(q[13]) - int32(v[13])
-	return uint32(d0*d0 + d1*d1 + d2*d2 + d3*d3 + d4*d4 +
-		d5*d5 + d6*d6 + d7*d7 + d8*d8 + d9*d9 +
-		d10*d10 + d11*d11 + d12*d12 + d13*d13)
 }
 
 // distStored returns squared integer Euclidean distance between two stored uint8 nodes.
@@ -167,9 +143,9 @@ func distStored(a, b []uint8) uint32 {
 }
 
 // quantizeQuery converts an incoming float32 query to int16 (uint8 range, signed
-// for subtraction). Called once per Query — amortized over all distance computations.
-func (h *HNSW) quantizeQuery(q [Dims]float32) [Dims]int16 {
-	var qv [Dims]int16
+// for subtraction). Elements [Dims..stride) are zero-padded for SSE2 alignment.
+func (h *HNSW) quantizeQuery(q [Dims]float32) [stride]int16 {
+	var qv [stride]int16
 	for d := 0; d < Dims; d++ {
 		v := (q[d] - h.qZero[d]) / h.qScale[d]
 		if v < 0 {
@@ -191,7 +167,7 @@ type pair struct {
 
 // queryState holds pre-allocated heaps and the pre-quantized query vector.
 type queryState struct {
-	qVec       [Dims]int16
+	qVec       [stride]int16
 	cands      []pair
 	results    []pair
 	candsArr   [maxEf]pair
@@ -460,7 +436,7 @@ func (h *HNSW) Insert(id int32) {
 	qs := &queryState{}
 	qs.cands = qs.candsArr[:0]
 	qs.results = qs.resultsArr[:0]
-	base := int(id) * Dims
+	base := int(id) * stride
 	for d := 0; d < Dims; d++ {
 		qs.qVec[d] = int16(h.vectors[base+d])
 	}
@@ -501,10 +477,10 @@ func (h *HNSW) Insert(id int32) {
 			if len(combined) <= mMax {
 				h.setNeighbors(nb.id, combined, l)
 			} else {
-				nbVec := h.vectors[int(nb.id)*Dims : int(nb.id)*Dims+Dims]
+				nbVec := h.vectors[int(nb.id)*stride : int(nb.id)*stride+stride]
 				pairs := make([]pair, len(combined))
 				for i, n := range combined {
-					pairs[i] = pair{distStored(nbVec, h.vectors[int(n)*Dims:int(n)*Dims+Dims]), n}
+					pairs[i] = pair{distStored(nbVec, h.vectors[int(n)*stride:int(n)*stride+stride]), n}
 				}
 				pruned := selectNeighbors(pairs, mMax)
 				pruneIDs := make([]int32, len(pruned))
@@ -720,7 +696,7 @@ func (h *HNSW) Vectors() []float32 {
 	out := make([]float32, h.N*Dims)
 	for i := 0; i < h.N; i++ {
 		for d := 0; d < Dims; d++ {
-			out[i*Dims+d] = float32(h.vectors[i*Dims+d])*h.qScale[d] + h.qZero[d]
+			out[i*Dims+d] = float32(h.vectors[i*stride+d])*h.qScale[d] + h.qZero[d]
 		}
 	}
 	return out

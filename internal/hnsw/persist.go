@@ -51,7 +51,7 @@ func (h *HNSW) SaveWithLabels(path string, labels []uint8) error {
 	if err := binary.Write(bw, binary.LittleEndian, h.qZero); err != nil {
 		return err
 	}
-	if _, err := bw.Write(h.vectors[:h.N*Dims]); err != nil {
+	if _, err := bw.Write(h.vectors[:h.N*stride]); err != nil {
 		return err
 	}
 	if _, err := bw.Write(h.nodeLevel[:h.N]); err != nil {
@@ -135,7 +135,7 @@ func Load(path string) (*HNSW, []uint8, error) {
 		N:              n,
 		ep:             ep,
 		epLevel:        int(epLevel32),
-		vectors:        make([]uint8, n*Dims),
+		vectors:        make([]uint8, n*stride),
 		nodeLevel:      make([]uint8, n),
 		conn0:          make([]int32, n*m0),
 		conn0cnt:       make([]uint8, n),

@@ -35,9 +35,9 @@ func (h *HNSW) Reorder(labels []uint8) []uint8 {
 		enqueue(int32(i))
 	}
 
-	newVec := make([]uint8, n*Dims)
+	newVec := make([]uint8, n*stride)
 	for newI, oldI := range oldByNew {
-		copy(newVec[newI*Dims:], h.vectors[int(oldI)*Dims:int(oldI)*Dims+Dims])
+		copy(newVec[newI*Dims:], h.vectors[int(oldI)*stride:int(oldI)*stride+stride])
 	}
 	h.vectors = newVec
 
