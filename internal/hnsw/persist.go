@@ -51,8 +51,11 @@ func (h *HNSW) SaveWithLabels(path string, labels []uint8) error {
 	if err := binary.Write(bw, binary.LittleEndian, h.qZero); err != nil {
 		return err
 	}
-	if _, err := bw.Write(h.vectors[:h.N*stride]); err != nil {
-		return err
+	// Write only the actual Dims bytes per node (not the stride padding).
+	for i := 0; i < h.N; i++ {
+		if _, err := bw.Write(h.vectors[i*stride : i*stride+Dims]); err != nil {
+			return err
+		}
 	}
 	if _, err := bw.Write(h.nodeLevel[:h.N]); err != nil {
 		return err
@@ -149,9 +152,15 @@ func Load(path string) (*HNSW, []uint8, error) {
 	if err := binary.Read(br, binary.LittleEndian, &h.qZero); err != nil {
 		return nil, nil, fmt.Errorf("qZero: %w", err)
 	}
-	if _, err := io.ReadFull(br, h.vectors); err != nil {
+	// On-disk format stores Dims bytes per node; zero-pad to stride in memory.
+	tmp := make([]uint8, n*Dims)
+	if _, err := io.ReadFull(br, tmp); err != nil {
 		return nil, nil, fmt.Errorf("vectors: %w", err)
 	}
+	for i := 0; i < n; i++ {
+		copy(h.vectors[i*stride:], tmp[i*Dims:(i+1)*Dims])
+	}
+	tmp = nil
 	if _, err := io.ReadFull(br, h.nodeLevel); err != nil {
 		return nil, nil, fmt.Errorf("nodeLevel: %w", err)
 	}
