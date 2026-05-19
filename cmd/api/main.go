@@ -3,6 +3,7 @@ package main
 import (
 	"log"
 	"runtime"
+	"time"
 
 	"github.com/NRLacerda/rinha-de-backend-2026/internal/handler"
 	"github.com/NRLacerda/rinha-de-backend-2026/internal/hnsw"
@@ -18,7 +19,12 @@ func main() {
 	}
 
 	h := handler.New(index, labels)
-	if err := fasthttp.ListenAndServe(":8080", h.Handle); err != nil {
+	srv := &fasthttp.Server{
+		Handler:      h.Handle,
+		ReadTimeout:  2 * time.Second,
+		WriteTimeout: 2 * time.Second,
+	}
+	if err := srv.ListenAndServe(":8080"); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
 }
