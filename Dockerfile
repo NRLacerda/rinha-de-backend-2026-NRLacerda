@@ -1,4 +1,4 @@
-# ---- Build stage (runs on native host, cross-compiles to arm64) -------------
+# ---- Build stage ------------------------------------------------------------
 FROM golang:1.22-bookworm AS builder
 
 WORKDIR /app
@@ -7,7 +7,7 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 \
     go build -ldflags="-s -w" -o /api ./cmd/api
 
 # ---- API image --------------------------------------------------------------
