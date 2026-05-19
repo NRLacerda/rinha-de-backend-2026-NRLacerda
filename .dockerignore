@@ -1,0 +1,5 @@
+resources/references.json
+resources/references.json.gz
+*.exe
+*.prof
+docs/
